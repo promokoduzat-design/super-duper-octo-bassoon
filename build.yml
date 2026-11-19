@@ -1,0 +1,625 @@
+name: build-apk
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: write project
+        run: |
+          mkdir -p "$(dirname 'AutoAim/app/build.gradle')"
+          cat > 'AutoAim/app/build.gradle' << 'AIM_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace = 'com.example.autoaim'
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = 'com.example.autoaim'
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/AndroidManifest.xml')"
+          cat > 'AutoAim/app/src/main/AndroidManifest.xml' << 'AIM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+              <application
+                  android:label="AutoAim"
+                  android:theme="@android:style/Theme.DeviceDefault">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".CaptureService"
+                      android:exported="false"
+                      android:foregroundServiceType="mediaProjection" />
+
+                  <service
+                      android:name=".AimService"
+                      android:exported="true"
+                      android:label="AutoAim"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/java/com/example/autoaim/AimService.java')"
+          cat > 'AutoAim/app/src/main/java/com/example/autoaim/AimService.java' << 'AIM_EOF'
+          package com.example.autoaim;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.accessibilityservice.GestureDescription;
+          import android.content.Intent;
+          import android.graphics.Path;
+          import android.view.KeyEvent;
+          import android.view.accessibility.AccessibilityEvent;
+          import android.widget.Toast;
+
+          public class AimService extends AccessibilityService {
+              static volatile AimService inst;
+
+              @Override protected void onServiceConnected() {
+                  inst = this;
+              }
+
+              @Override public boolean onUnbind(Intent i) {
+                  inst = null;
+                  return super.onUnbind(i);
+              }
+
+              @Override public void onAccessibilityEvent(AccessibilityEvent e) { }
+
+              @Override public void onInterrupt() { }
+
+              /** Громкость+ = вкл/выкл, громкость- = выкл. Работает, только пока идёт захват экрана. */
+              @Override protected boolean onKeyEvent(KeyEvent e) {
+                  int k = e.getKeyCode();
+                  if (!Cfg.armed || (k != KeyEvent.KEYCODE_VOLUME_UP && k != KeyEvent.KEYCODE_VOLUME_DOWN)) return false;
+                  if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
+                      Cfg.on = k == KeyEvent.KEYCODE_VOLUME_UP && !Cfg.on;
+                      Toast.makeText(this, Cfg.on ? "AutoAim ВКЛ" : "AutoAim ВЫКЛ", Toast.LENGTH_SHORT).show();
+                  }
+                  return true;
+              }
+
+              void swipe(float x1, float y1, float x2, float y2) {
+                  Path p = new Path();
+                  p.moveTo(x1, y1);
+                  p.lineTo(x2, y2);
+                  dispatchGesture(new GestureDescription.Builder()
+                          .addStroke(new GestureDescription.StrokeDescription(p, 0, 120))
+                          .build(), null, null);
+              }
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/java/com/example/autoaim/CaptureService.java')"
+          cat > 'AutoAim/app/src/main/java/com/example/autoaim/CaptureService.java' << 'AIM_EOF'
+          package com.example.autoaim;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.ContentValues;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.graphics.Bitmap;
+          import android.graphics.Canvas;
+          import android.graphics.Paint;
+          import android.graphics.PixelFormat;
+          import android.graphics.Rect;
+          import android.hardware.display.DisplayManager;
+          import android.hardware.display.VirtualDisplay;
+          import android.media.Image;
+          import android.media.ImageReader;
+          import android.media.projection.MediaProjection;
+          import android.media.projection.MediaProjectionManager;
+          import android.net.Uri;
+          import android.os.Handler;
+          import android.os.HandlerThread;
+          import android.os.IBinder;
+          import android.os.Looper;
+          import android.provider.MediaStore;
+          import android.view.WindowManager;
+          import android.widget.Toast;
+
+          import java.io.OutputStream;
+          import java.nio.ByteBuffer;
+          import java.util.List;
+
+          public class CaptureService extends Service {
+              private HandlerThread thread;
+              private Handler handler;
+              private MediaProjection proj;
+              private VirtualDisplay vd;
+              private ImageReader reader;
+              private Detector det;
+              private byte[] buf;
+              private int cw, ch, realW, realH;
+              private long lastShot, lastFrame;
+
+              @Override public IBinder onBind(Intent i) {
+                  return null;
+              }
+
+              @Override @SuppressWarnings("deprecation")
+              public int onStartCommand(Intent i, int flags, int startId) {
+                  // startForeground нужен на каждый startForegroundService, иначе система убьёт приложение
+                  NotificationManager nm = getSystemService(NotificationManager.class);
+                  nm.createNotificationChannel(new NotificationChannel("aim", "AutoAim", NotificationManager.IMPORTANCE_LOW));
+                  Notification n = new Notification.Builder(this, "aim")
+                          .setContentTitle("AutoAim")
+                          .setContentText("громкость+ = вкл/выкл")
+                          .setSmallIcon(android.R.drawable.ic_dialog_info)
+                          .build();
+                  startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION);
+
+                  if (proj != null) return START_NOT_STICKY;   // уже работает
+                  Intent data = null;
+                  if (i != null) data = i.getParcelableExtra("data");
+                  if (data == null) {
+                      stopSelf();
+                      return START_NOT_STICKY;
+                  }
+                  proj = getSystemService(MediaProjectionManager.class).getMediaProjection(i.getIntExtra("code", 0), data);
+
+                  thread = new HandlerThread("cap");
+                  thread.start();
+                  handler = new Handler(thread.getLooper());
+                  proj.registerCallback(new MediaProjection.Callback() {
+                      @Override public void onStop() {
+                          stopSelf();
+                      }
+                  }, handler);
+
+                  // игра идёт в ландшафте: размеры берём как большая x меньшая сторона экрана
+                  Rect b = getSystemService(WindowManager.class).getMaximumWindowMetrics().getBounds();
+                  realW = Math.max(b.width(), b.height());
+                  realH = Math.min(b.width(), b.height());
+                  ch = Cfg.WORK_H;
+                  cw = Math.round(realW * (float) ch / realH);
+                  det = new Detector(cw, ch);
+                  reader = ImageReader.newInstance(cw, ch, PixelFormat.RGBA_8888, 2);
+                  reader.setOnImageAvailableListener(r -> onFrame(r), handler);
+                  vd = proj.createVirtualDisplay("aim", cw, ch, getResources().getDisplayMetrics().densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR, reader.getSurface(), null, handler);
+                  Cfg.armed = true;
+                  return START_NOT_STICKY;
+              }
+
+              private void onFrame(ImageReader r) {
+                  Image img = r.acquireLatestImage();
+                  if (img == null) return;
+                  try {
+                      if (!Cfg.on && !Cfg.dump) return;
+                      long now = System.currentTimeMillis();
+                      if (now - lastFrame < 60) return;
+                      lastFrame = now;
+                      Image.Plane pl = img.getPlanes()[0];
+                      ByteBuffer bb = pl.getBuffer();
+                      int n = bb.remaining();
+                      if (buf == null || buf.length != n) buf = new byte[n];
+                      bb.get(buf, 0, n);
+                      int rs = pl.getRowStride(), ps = pl.getPixelStride();
+                      List<Detector.Hit> hits = det.find(buf, rs, ps);
+                      Detector.Hit t = Detector.nearest(hits, cw / 2, ch / 2);
+                      if (Cfg.dump) {
+                          Cfg.dump = false;
+                          dumpFrame(rs, ps, hits);
+                      }
+                      AimService s = AimService.inst;
+                      if (Cfg.on && t != null && s != null && now - lastShot > Cfg.COOLDOWN_MS) {
+                          float[] sw = Detector.swipe(t, cw, ch, realW, realH);
+                          s.swipe(sw[0], sw[1], sw[2], sw[3]);
+                          lastShot = now;
+                      }
+                  } finally {
+                      img.close();
+                  }
+              }
+
+              /** Кадр с разметкой в Галерею: зелёная рамка = бар, жёлтый круг = точка прицела, голубой круг = кнопка атаки. */
+              private void dumpFrame(int rs, int ps, List<Detector.Hit> hits) {
+                  try {
+                      int[] px = new int[cw * ch];
+                      for (int y = 0; y < ch; y++) {
+                          for (int x = 0; x < cw; x++) {
+                              int i = y * rs + x * ps;
+                              px[y * cw + x] = 0xFF000000 | ((buf[i] & 0xFF) << 16) | ((buf[i + 1] & 0xFF) << 8) | (buf[i + 2] & 0xFF);
+                          }
+                      }
+                      Bitmap bmp = Bitmap.createBitmap(cw, ch, Bitmap.Config.ARGB_8888);
+                      bmp.setPixels(px, 0, cw, 0, 0, cw, ch);
+                      Canvas c = new Canvas(bmp);
+                      Paint p = new Paint();
+                      p.setStyle(Paint.Style.STROKE);
+                      p.setStrokeWidth(2f);
+                      p.setColor(0xFF00FF00);
+                      for (Detector.Hit t : hits) c.drawRect(t.bx - 2, t.by - 2, t.bx + t.bw + 2, t.by + t.bh + 2, p);
+                      p.setColor(0xFFFFFF00);
+                      for (Detector.Hit t : hits) c.drawCircle(t.x, t.y, 8, p);
+                      p.setColor(0xFFFFFFFF);
+                      c.drawLine(cw / 2f - 14, ch / 2f, cw / 2f + 14, ch / 2f, p);
+                      c.drawLine(cw / 2f, ch / 2f - 14, cw / 2f, ch / 2f + 14, p);
+                      p.setColor(0xFF00FFFF);
+                      p.setStrokeWidth(3f);
+                      c.drawCircle(Cfg.joyX * cw, Cfg.joyY * ch, 16, p);
+
+                      ContentValues cv = new ContentValues();
+                      cv.put(MediaStore.Images.Media.DISPLAY_NAME, "autoaim_" + System.currentTimeMillis() + ".png");
+                      cv.put(MediaStore.Images.Media.MIME_TYPE, "image/png");
+                      cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/AutoAim");
+                      Uri u = getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv);
+                      if (u == null) {
+                          toast("не смог сохранить снимок");
+                          return;
+                      }
+                      try (OutputStream os = getContentResolver().openOutputStream(u)) {
+                          bmp.compress(Bitmap.CompressFormat.PNG, 100, os);
+                      }
+                      toast("снимок: Галерея, Pictures/AutoAim, врагов " + hits.size());
+                  } catch (Exception e) {
+                      toast("снимок не вышел: " + e);
+                  }
+              }
+
+              private void toast(String s) {
+                  new Handler(Looper.getMainLooper()).post(() -> Toast.makeText(this, s, Toast.LENGTH_SHORT).show());
+              }
+
+              @Override public void onDestroy() {
+                  Cfg.armed = false;
+                  Cfg.on = false;
+                  if (vd != null) vd.release();
+                  if (reader != null) reader.close();
+                  if (proj != null) proj.stop();
+                  if (thread != null) thread.quitSafely();
+                  super.onDestroy();
+              }
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/java/com/example/autoaim/Cfg.java')"
+          cat > 'AutoAim/app/src/main/java/com/example/autoaim/Cfg.java' << 'AIM_EOF'
+          package com.example.autoaim;
+
+          final class Cfg {
+              static volatile boolean on;          // аим включён (громкость+)
+              static volatile boolean armed;       // захват экрана запущен
+              static volatile boolean dump;        // сохранить отладочный кадр при ближайшем кадре
+              static volatile float joyX = 0.86f;  // FILL: центр кнопки атаки, доля ширины экрана
+              static volatile float joyY = 0.74f;  // FILL: доля высоты экрана
+
+              static final int WORK_H = 590;       // кадр сжимается до высоты 590, пиксели ниже — в этом масштабе
+              static final float JOY_R_F = 0.15f;  // длина свайпа, доля высоты экрана
+              static final int MIN_BAR_W = 6;      // мин. ширина КРАСНОЙ части бара (сжимается вместе с хп)
+              static final int BODY_DX = 30;       // FILL: от левого края бара до центра тела
+              static final int BODY_DY = 45;       // FILL: от низа бара до центра тела
+              static final float TOP_SKIP = 0.10f; // верх экрана — HUD (счёт, гемы), красное там не враг
+              static final long COOLDOWN_MS = 350; // пауза между выстрелами
+
+              private Cfg() { }
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/java/com/example/autoaim/Detector.java')"
+          cat > 'AutoAim/app/src/main/java/com/example/autoaim/Detector.java' << 'AIM_EOF'
+          package com.example.autoaim;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          final class Detector {
+              static final class Hit {
+                  final int x, y;            // точка прицела (пиксели рабочего кадра)
+                  final int bx, by, bw, bh;  // рамка красной части бара
+                  Hit(int x, int y, int bx, int by, int bw, int bh) {
+                      this.x = x;
+                      this.y = y;
+                      this.bx = bx;
+                      this.by = by;
+                      this.bw = bw;
+                      this.bh = bh;
+                  }
+              }
+
+              private final int w, h;
+              private final boolean[] red;
+              private final int[] stack;
+
+              Detector(int w, int h) {
+                  this.w = w;
+                  this.h = h;
+                  red = new boolean[w * h];
+                  stack = new int[w * h];
+              }
+
+              /** px — RGBA_8888, как отдаёт ImageReader; rs — rowStride, ps — pixelStride. */
+              List<Hit> find(byte[] px, int rs, int ps) {
+                  for (int y = 0; y < h; y++) {
+                      int row = y * rs;
+                      for (int x = 0; x < w; x++) {
+                          int i = row + x * ps;
+                          int r = px[i] & 0xFF, g = px[i + 1] & 0xFF, b = px[i + 2] & 0xFF;
+                          red[y * w + x] = r >= 150 && g * 100 <= r * 35 && b * 100 <= r * 35;
+                      }
+                  }
+                  List<Hit> out = new ArrayList<>();
+                  int minY = (int) (Cfg.TOP_SKIP * h);
+                  for (int y = 0; y < h; y++) {
+                      for (int x = 0; x < w; x++) {
+                          int p = y * w + x;
+                          if (!red[p]) continue;
+                          int sp = 0, x0 = x, x1 = x, y0 = y, y1 = y;
+                          stack[sp++] = p;
+                          red[p] = false;
+                          while (sp > 0) {
+                              int q = stack[--sp];
+                              int qx = q % w, qy = q / w;
+                              if (qx < x0) x0 = qx;
+                              if (qx > x1) x1 = qx;
+                              if (qy < y0) y0 = qy;
+                              if (qy > y1) y1 = qy;
+                              if (qx > 0 && red[q - 1]) { red[q - 1] = false; stack[sp++] = q - 1; }
+                              if (qx < w - 1 && red[q + 1]) { red[q + 1] = false; stack[sp++] = q + 1; }
+                              if (qy > 0 && red[q - w]) { red[q - w] = false; stack[sp++] = q - w; }
+                              if (qy < h - 1 && red[q + w]) { red[q + w] = false; stack[sp++] = q + w; }
+                          }
+                          int bw = x1 - x0 + 1, bh = y1 - y0 + 1;
+                          // плоская полоска при любом хп, не в HUD сверху
+                          if (y0 >= minY && bw >= Cfg.MIN_BAR_W && bw >= bh && bh >= 3 && bh <= 22) {
+                              out.add(new Hit(x0 + Cfg.BODY_DX, y0 + bh + Cfg.BODY_DY, x0, y0, bw, bh));
+                          }
+                      }
+                  }
+                  return out;
+              }
+
+              /** Ближайший к центру кадра (там стоит твой бравлер). */
+              static Hit nearest(List<Hit> hits, int cx, int cy) {
+                  Hit best = null;
+                  long bd = Long.MAX_VALUE;
+                  for (Hit t : hits) {
+                      long dx = t.x - cx, dy = t.y - cy, d = dx * dx + dy * dy;
+                      if (d < bd) {
+                          bd = d;
+                          best = t;
+                      }
+                  }
+                  return best;
+              }
+
+              /** {x1, y1, x2, y2} в пикселях экрана: от центра кнопки атаки в сторону цели. cw x ch — рабочий кадр. */
+              static float[] swipe(Hit t, int cw, int ch, int realW, int realH) {
+                  float dx = t.x - cw / 2f, dy = t.y - ch / 2f;
+                  float d = (float) Math.hypot(dx, dy);
+                  if (d < 1f) d = 1f;
+                  float x1 = Cfg.joyX * realW, y1 = Cfg.joyY * realH, r = Cfg.JOY_R_F * realH;
+                  float x2 = Math.max(0f, Math.min(realW - 1f, x1 + dx / d * r));
+                  float y2 = Math.max(0f, Math.min(realH - 1f, y1 + dy / d * r));
+                  return new float[] { x1, y1, x2, y2 };
+              }
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/java/com/example/autoaim/MainActivity.java')"
+          cat > 'AutoAim/app/src/main/java/com/example/autoaim/MainActivity.java' << 'AIM_EOF'
+          package com.example.autoaim;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.media.projection.MediaProjectionManager;
+          import android.os.Bundle;
+          import android.provider.Settings;
+          import android.text.InputType;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+              private TextView status;
+              private EditText ex, ey;
+
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  SharedPreferences sp = getSharedPreferences("cfg", MODE_PRIVATE);
+                  Cfg.joyX = sp.getFloat("jx", Cfg.joyX);
+                  Cfg.joyY = sp.getFloat("jy", Cfg.joyY);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(40, 80, 40, 40);
+
+                  status = new TextView(this);
+                  status.setTextSize(15);
+                  root.addView(status);
+                  root.addView(btn("1. включить AutoAim в спецвозможностях",
+                          v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))));
+                  root.addView(btn("2. запись экрана: запустить (выбери «весь экран»)",
+                          v -> startActivityForResult(
+                                  getSystemService(MediaProjectionManager.class).createScreenCaptureIntent(), 1)));
+                  root.addView(btn("снимок кадра: нажми и переключись в игру", v -> Cfg.dump = true));
+
+                  TextView hint = new TextView(this);
+                  hint.setText("кнопка атаки, % экрана: x и y (голубой круг на снимке = текущая)");
+                  root.addView(hint);
+                  ex = field(Cfg.joyX * 100);
+                  ey = field(Cfg.joyY * 100);
+                  root.addView(ex);
+                  root.addView(ey);
+                  root.addView(btn("сохранить кнопку атаки", v -> saveJoy()));
+                  root.addView(btn("остановить захват", v -> {
+                      stopService(new Intent(this, CaptureService.class));
+                      refresh();
+                  }));
+                  root.addView(btn("обновить статус", v -> refresh()));
+
+                  ScrollView sv = new ScrollView(this);
+                  sv.addView(root);
+                  setContentView(sv);
+              }
+
+              @Override protected void onResume() {
+                  super.onResume();
+                  refresh();
+              }
+
+              @Override protected void onActivityResult(int req, int res, Intent data) {
+                  super.onActivityResult(req, res, data);
+                  if (req == 1 && res == RESULT_OK && data != null) {
+                      startForegroundService(new Intent(this, CaptureService.class)
+                              .putExtra("code", res)
+                              .putExtra("data", data));
+                  }
+              }
+
+              private Button btn(String t, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(t);
+                  b.setOnClickListener(l);
+                  return b;
+              }
+
+              private EditText field(float v) {
+                  EditText e = new EditText(this);
+                  e.setInputType(InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_FLAG_DECIMAL);
+                  e.setText(String.valueOf(Math.round(v * 10) / 10f));
+                  return e;
+              }
+
+              private void saveJoy() {
+                  try {
+                      float x = Float.parseFloat(ex.getText().toString().replace(',', '.')) / 100f;
+                      float y = Float.parseFloat(ey.getText().toString().replace(',', '.')) / 100f;
+                      if (x > 0.3f && x < 1f && y > 0.3f && y < 1f) {
+                          Cfg.joyX = x;
+                          Cfg.joyY = y;
+                          getSharedPreferences("cfg", MODE_PRIVATE).edit().putFloat("jx", x).putFloat("jy", y).apply();
+                      }
+                  } catch (NumberFormatException e) {
+                      // пустое поле или мусор: оставляем как было
+                  }
+                  refresh();
+              }
+
+              private void refresh() {
+                  status.setText("спецвозможности: " + (AimService.inst != null ? "вкл" : "ВЫКЛ")
+                          + "\nзахват экрана: " + (Cfg.armed ? "идёт" : "стоит")
+                          + "\nаим: " + (Cfg.on ? "ВКЛ" : "выкл")
+                          + "\nкнопка атаки: " + Math.round(Cfg.joyX * 100) + "%, " + Math.round(Cfg.joyY * 100) + "%"
+                          + "\n\nв игре: громкость+ вкл/выкл, громкость- выкл."
+                          + "\nтест: тренировочная пещера, стой на месте.");
+              }
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/res/values/strings.xml')"
+          cat > 'AutoAim/app/src/main/res/values/strings.xml' << 'AIM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="service_desc">AutoAim: свайпы по кнопке атаки и кнопки громкости для вкл/выкл</string>
+          </resources>
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/app/src/main/res/xml/accessibility_config.xml')"
+          cat > 'AutoAim/app/src/main/res/xml/accessibility_config.xml' << 'AIM_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRequestFilterKeyEvents"
+              android:canPerformGestures="true"
+              android:canRequestFilterKeyEvents="true"
+              android:description="@string/service_desc"
+              android:notificationTimeout="100" />
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/build.gradle')"
+          cat > 'AutoAim/build.gradle' << 'AIM_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/gradle.properties')"
+          cat > 'AutoAim/gradle.properties' << 'AIM_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          AIM_EOF
+          mkdir -p "$(dirname 'AutoAim/settings.gradle')"
+          cat > 'AutoAim/settings.gradle' << 'AIM_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'AutoAim'
+          include ':app'
+          AIM_EOF
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: build
+        run: |
+          curl -sSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o /tmp/g.zip
+          unzip -q /tmp/g.zip -d "$HOME"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          cd AutoAim
+          "$HOME/gradle-8.7/bin/gradle" --no-daemon --console=plain assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AutoAim-apk
+          path: AutoAim/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" AutoAim/app/build/outputs/apk/debug/app-debug.apk --repo "${{ github.repository }}" --title "AutoAim build ${{ github.run_number }}" --notes "debug apk"
